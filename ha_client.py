@@ -5,14 +5,32 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+WEATHER_ENTITY = "weather.forecast_home"
+
 
 class HAClient:
-    def __init__(self, url, token, on_state_change):
+    def __init__(self, url, token, on_state_change, on_forecast=None):
         self.url = url
         self.token = token
         self.on_state_change = on_state_change
+        self.on_forecast = on_forecast
         self.states = {}
         self._msg_id = 3  # 1 and 2 are used during init
+        self._forecast_id = None
+
+    async def _request_forecast(self, ws):
+        mid = self._msg_id
+        self._msg_id += 1
+        self._forecast_id = mid
+        await ws.send(json.dumps({
+            "id": mid,
+            "type": "call_service",
+            "domain": "weather",
+            "service": "get_forecasts",
+            "target": {"entity_id": WEATHER_ENTITY},
+            "service_data": {"type": "daily"},
+            "return_response": True,
+        }))
 
     async def run(self):
         while True:
@@ -44,6 +62,9 @@ class HAClient:
                 "event_type": "state_changed",
             }))
 
+            if self.on_forecast:
+                await self._request_forecast(ws)
+
             async for raw in ws:
                 msg = json.loads(raw)
                 if msg.get("type") == "event":
@@ -51,3 +72,13 @@ class HAClient:
                     if new:
                         self.states[new["entity_id"]] = new
                         self.on_state_change(self.states)
+                        # Refresh forecast when the weather entity updates
+                        if self.on_forecast and new["entity_id"] == WEATHER_ENTITY:
+                            await self._request_forecast(ws)
+                elif msg.get("type") == "result" and msg.get("id") == self._forecast_id:
+                    if self.on_forecast and msg.get("success"):
+                        try:
+                            forecast = msg["result"]["response"][WEATHER_ENTITY]["forecast"]
+                            self.on_forecast(forecast)
+                        except (KeyError, TypeError):
+                            pass

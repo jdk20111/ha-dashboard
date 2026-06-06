@@ -1,7 +1,9 @@
 import asyncio
+import math
 import os
 import threading
 import time
+from datetime import datetime
 import numpy as np
 import pygame
 from config import HA_WS_URL, HA_TOKEN, SCREEN_WIDTH, SCREEN_HEIGHT
@@ -16,6 +18,8 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 _states: dict = {}
 _states_lock = threading.Lock()
 _connected = False
+_forecast: list = []
+_forecast_lock = threading.Lock()
 
 
 def on_state_change(new_states: dict):
@@ -25,8 +29,14 @@ def on_state_change(new_states: dict):
         _connected = True
 
 
+def on_forecast(forecast: list):
+    global _forecast
+    with _forecast_lock:
+        _forecast = forecast
+
+
 def ws_thread():
-    client = HAClient(HA_WS_URL, HA_TOKEN, on_state_change)
+    client = HAClient(HA_WS_URL, HA_TOKEN, on_state_change, on_forecast)
     asyncio.run(client.run())
 
 
@@ -102,6 +112,11 @@ CARD_H   = (SCREEN_HEIGHT - HDR_H - PAD * 4) // 3  # 3 rows
 TITLE_H  = 26
 LINE_H   = 28
 
+# Header zones: [clock | forecast | current weather]
+FC_X0    = 230                       # forecast zone left edge
+FC_X1    = 790                       # forecast zone right edge
+FC_COL_W = (FC_X1 - FC_X0) // 3     # 186px per forecast column
+
 
 def card_rect(col: int, row: int) -> pygame.Rect:
     x = PAD + col * (CARD_W + PAD)
@@ -124,17 +139,70 @@ def row(surf, fonts, x, y, label, value, val_color=TEXT, label_w=160):
 
 
 # ---------------------------------------------------------------------------
+# Weather icon drawing
+# ---------------------------------------------------------------------------
+def _draw_cloud(surf, cx, cy, w, h):
+    c = (150, 165, 185)
+    pygame.draw.ellipse(surf, c, pygame.Rect(cx - w//2, cy - h//4, w, h//2 + 4))
+    pygame.draw.circle(surf, c, (cx - w//4, cy), h//2)
+    pygame.draw.circle(surf, c, (cx + w//6, cy - h//3), h//3 + 1)
+
+
+def draw_wx_icon(surf, cx, cy, condition):
+    if condition == "sunny":
+        pygame.draw.circle(surf, YELLOW, (cx, cy), 9)
+        for a in range(0, 360, 45):
+            r = math.radians(a)
+            pygame.draw.line(surf, YELLOW,
+                (int(cx + 12*math.cos(r)), int(cy + 12*math.sin(r))),
+                (int(cx + 17*math.cos(r)), int(cy + 17*math.sin(r))), 2)
+    elif condition == "clear-night":
+        pygame.draw.circle(surf, (220, 210, 160), (cx, cy), 11)
+        pygame.draw.circle(surf, BG, (cx + 6, cy - 4), 9)
+    elif condition == "partlycloudy":
+        pygame.draw.circle(surf, YELLOW, (cx - 6, cy + 5), 8)
+        for a in range(0, 360, 60):
+            r = math.radians(a)
+            pygame.draw.line(surf, YELLOW,
+                (int(cx - 6 + 10*math.cos(r)), int(cy + 5 + 10*math.sin(r))),
+                (int(cx - 6 + 14*math.cos(r)), int(cy + 5 + 14*math.sin(r))), 2)
+        _draw_cloud(surf, cx + 4, cy - 2, 16, 10)
+    elif condition == "cloudy":
+        _draw_cloud(surf, cx, cy, 22, 14)
+    elif condition == "fog":
+        for i in range(4):
+            pygame.draw.line(surf, DIM, (cx - 14, cy - 8 + i*6), (cx + 14, cy - 8 + i*6), 2)
+    elif condition in ("rainy", "pouring"):
+        _draw_cloud(surf, cx, cy - 6, 20, 12)
+        for i in range(3):
+            pygame.draw.line(surf, ACCENT, (cx - 8 + i*8, cy + 6), (cx - 11 + i*8, cy + 15), 2)
+    elif condition in ("lightning", "lightning-rainy"):
+        _draw_cloud(surf, cx, cy - 6, 20, 12)
+        pts = [(cx+2, cy+5), (cx-4, cy+13), (cx+1, cy+13), (cx-5, cy+21)]
+        pygame.draw.lines(surf, YELLOW, False, pts, 2)
+    elif condition in ("snowy", "snowy-rainy", "hail"):
+        _draw_cloud(surf, cx, cy - 6, 20, 12)
+        for i in range(3):
+            pygame.draw.circle(surf, TEXT, (cx - 8 + i*8, cy + 13), 2)
+    elif condition in ("windy", "windy-variant"):
+        for i in range(3):
+            y = cy - 6 + i*7
+            pygame.draw.arc(surf, DIM, pygame.Rect(cx - 14, y - 3, 20, 8), 0, math.pi, 2)
+            pygame.draw.line(surf, DIM, (cx + 6, y + 1), (cx + 14, y + 1), 2)
+    else:
+        pygame.draw.circle(surf, DIM, (cx, cy), 11, 2)
+
+
+# ---------------------------------------------------------------------------
 # Card renderers
 # ---------------------------------------------------------------------------
 def draw_header(surf: pygame.Surface, fonts: dict):
+    # Left zone: clock + date
     now = time.localtime()
-    clock_str = time.strftime("%-I:%M %p", now)
-    date_str  = time.strftime("%A, %B %-d", now)
+    surf.blit(fonts["xl"].render(time.strftime("%-I:%M %p", now), True, TEXT), (PAD + 4, 8))
+    surf.blit(fonts["sm"].render(time.strftime("%A, %B %-d", now), True, DIM), (PAD + 6, 62))
 
-    surf.blit(fonts["xl"].render(clock_str, True, TEXT), (PAD + 4, 8))
-    surf.blit(fonts["sm"].render(date_str,  True, DIM),  (PAD + 6, 62))
-
-    # Weather block on right
+    # Right zone: current conditions
     wx_state = state_of("weather.forecast_home", "")
     wx_label = WEATHER_LABELS.get(wx_state, wx_state.replace("-", " ").title())
     wx_temp  = attr_of("weather.forecast_home", "temperature")
@@ -151,12 +219,32 @@ def draw_header(surf: pygame.Surface, fonts: dict):
 
     wx_line1 = f"{parts[0]}  {parts[1]}" if len(parts) >= 2 else parts[0]
     wx_line2 = "  ".join(parts[2:]) if len(parts) > 2 else ""
-
     s1 = fonts["lg"].render(wx_line1, True, TEXT)
     surf.blit(s1, (SCREEN_WIDTH - s1.get_width() - PAD, 10))
     if wx_line2:
         s2 = fonts["sm"].render(wx_line2, True, DIM)
         surf.blit(s2, (SCREEN_WIDTH - s2.get_width() - PAD, 50))
+
+    # Center zone: 3-day forecast icons + hi/lo
+    with _forecast_lock:
+        fc = _forecast[:3]
+    for i, entry in enumerate(fc):
+        cx = FC_X0 + i * FC_COL_W + FC_COL_W // 2
+        try:
+            day = datetime.fromisoformat(entry["datetime"]).strftime("%a").upper()
+        except (KeyError, ValueError):
+            day = "---"
+        cond   = entry.get("condition", "")
+        hi_str = fmt_temp(entry["temperature"]) if "temperature" in entry else "--"
+        lo_str = fmt_temp(entry["templow"])     if "templow"     in entry else "--"
+
+        day_s = fonts["sm"].render(day, True, ACCENT)
+        surf.blit(day_s, (cx - day_s.get_width() // 2, 2))
+        draw_wx_icon(surf, cx, 36, cond)
+        hi_s = fonts["sm"].render(hi_str, True, ORANGE)
+        surf.blit(hi_s, (cx - hi_s.get_width() // 2, 56))
+        lo_s = fonts["sm"].render(lo_str, True, ACCENT)
+        surf.blit(lo_s, (cx - lo_s.get_width() // 2, 72))
 
     pygame.draw.line(surf, CARD_HEAD, (0, HDR_H - 1), (SCREEN_WIDTH, HDR_H - 1))
 
