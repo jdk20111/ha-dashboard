@@ -1,0 +1,18 @@
+[Unit]
+Description=Home Assistant Status Board
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jdk201
+WorkingDirectory=/home/jdk201/ha-dashboard
+EnvironmentFile=/home/jdk201/ha-dashboard/.env
+ExecStart=/usr/bin/python3 /home/jdk201/ha-dashboard/main.py
+Restart=always
+RestartSec=10
+Environment=SDL_VIDEODRIVER=offscreen
+Environment=SDL_AUDIODRIVER=dummy
+
+[Install]
+WantedBy=multi-user.target
