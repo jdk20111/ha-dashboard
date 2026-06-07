@@ -22,19 +22,42 @@ _states_lock = threading.Lock()
 _connected = False
 _forecast: list = []
 _forecast_lock = threading.Lock()
+_dirty = threading.Event()
+
+_WATCHED_ENTITIES = {
+    "climate.ecobee_thermostat_thermostat", "climate.hottub",
+    "cover.garage_door",
+    "light.bedroom_lamp_laura", "light.garage_light_center",
+    "light.garage_outdoor_light_right", "light.garage_outside_light_left",
+    "light.kitchen_bar_lights", "light.kitchen_counter_lights",
+    "light.landscape_lights", "light.livingroom_standing_lamp",
+    "light.livingroom_table_lamp", "light.master_bedroom_lamp",
+    "light.porch_light", "light.shop_lights", "light.tv_light",
+    "sensor.downstairs_temperature", "sensor.ecobee_upstairs_current_humidity",
+    "sensor.ecobee_upstairs_current_temperature", "sensor.family_locations",
+    "sensor.furnace_filter_age", "sensor.hot_tub_water_age",
+    "sensor.m5_download_speed", "sensor.m5_upload_speed",
+    "sensor.steam_sales", "sensor.tp_link_router_total_clients",
+    "sensor.upcoming_calendar_events", "sensor.water_tank_level",
+    "sensor.xcel_itron_instantaneous_demand_value",
+    "weather.pirateweather",
+}
 
 
-def on_state_change(new_states: dict):
+def on_state_change(new_states: dict, changed_entity: str | None):
     global _states, _connected
     with _states_lock:
         _states = new_states
         _connected = True
+    if changed_entity is None or changed_entity in _WATCHED_ENTITIES:
+        _dirty.set()
 
 
 def on_forecast(forecast: list):
     global _forecast
     with _forecast_lock:
         _forecast = forecast
+    _dirty.set()
 
 
 def ws_thread():
@@ -596,27 +619,39 @@ def main():
 
     threading.Thread(target=ws_thread, daemon=True).start()
     clock = pygame.time.Clock()
+    _last_minute = -1
+    _last_render = 0.0
 
     try:
         while True:
-            screen.fill(BG)
+            now = time.localtime()
+            if now.tm_min != _last_minute:
+                _dirty.set()
+                _last_minute = now.tm_min
 
-            with _states_lock:
-                connected = _connected
+            mono = time.monotonic()
+            if _dirty.is_set() and (mono - _last_render) >= 1.0:
+                _dirty.clear()
+                _last_render = mono
+                screen.fill(BG)
 
-            if not connected:
-                draw_connecting(screen, fonts)
-            else:
-                draw_header(screen, fonts)
-                draw_climate(screen,  fonts, card_rect(0, 0))
-                draw_power(screen,    fonts, card_rect(1, 0))
-                draw_security(screen, fonts, card_rect(0, 1))
-                draw_family(screen,   fonts, card_rect(1, 1))
-                draw_calendar(screen, fonts, card_rect(0, 2))
-                draw_lights(screen,   fonts, card_rect(1, 2))
+                with _states_lock:
+                    connected = _connected
 
-            _write_to_fb(screen)
-            clock.tick(10)
+                if not connected:
+                    draw_connecting(screen, fonts)
+                else:
+                    draw_header(screen, fonts)
+                    draw_climate(screen,  fonts, card_rect(0, 0))
+                    draw_power(screen,    fonts, card_rect(1, 0))
+                    draw_security(screen, fonts, card_rect(0, 1))
+                    draw_family(screen,   fonts, card_rect(1, 1))
+                    draw_calendar(screen, fonts, card_rect(0, 2))
+                    draw_lights(screen,   fonts, card_rect(1, 2))
+
+                _write_to_fb(screen)
+
+            clock.tick(4)
     finally:
         pygame.quit()
         if _fb_file:

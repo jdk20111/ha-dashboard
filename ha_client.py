@@ -53,7 +53,7 @@ class HAClient:
             result = json.loads(await ws.recv())
             for state in result.get("result", []):
                 self.states[state["entity_id"]] = state
-            self.on_state_change(self.states)
+            self.on_state_change(self.states, None)
 
             # Subscribe to all state_changed events
             await ws.send(json.dumps({
@@ -70,8 +70,9 @@ class HAClient:
                 if msg.get("type") == "event":
                     new = msg["event"]["data"].get("new_state")
                     if new:
-                        self.states[new["entity_id"]] = new
-                        self.on_state_change(self.states)
+                        entity_id = new["entity_id"]
+                        self.states[entity_id] = new
+                        self.on_state_change(self.states, entity_id)
                         # Refresh forecast when the weather entity updates
                         if self.on_forecast and new["entity_id"] == WEATHER_ENTITY:
                             await self._request_forecast(ws)
