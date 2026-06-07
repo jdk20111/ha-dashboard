@@ -306,7 +306,7 @@ def draw_security(surf, fonts, rect):
             garage.upper() if garage != "--" else "--", g_color)
 
     water = state_of("sensor.water_tank_level")
-    y = row(surf, fonts, x, y, "Water Tank", water)
+    y = row(surf, fonts, x, y, "Waterfall", water)
 
     ht_temp = attr_of("climate.hottub", "current_temperature")
     ht_set  = attr_of("climate.hottub", "temperature")
@@ -347,37 +347,45 @@ def draw_family(surf, fonts, rect):
     draw_card(surf, fonts, rect, "FAMILY")
     x, y = rect.x + 10, rect.y + TITLE_H + 4
 
-    members = [
-        ("Jonathan", "person.jonathan", "sensor.dad_iphone_battery"),
-        ("Laura",    "person.laura",    "sensor.laura_kennedys_iphone_battery"),
-        ("Jonny",    "person.jonny",    "sensor.jonnys_iphone_battery"),
-        ("Bella",    "person.bella",    "sensor.bellas_iphone_battery"),
-        ("Andrew",   "person.andrew",   "sensor.mt_repairs_iphone_battery"),
-    ]
+    order  = ["jonathan", "laura", "jonny", "bella", "andrew"]
+    labels = {"jonathan": "Jonathan", "laura": "Laura", "jonny": "Jonny",
+              "bella": "Bella", "andrew": "Andrew"}
+    members = attr_of("sensor.family_locations", "members", {})
 
     BAT_X  = rect.right - 50
+    DIST_X = rect.right - 130
     ROW_H  = 25
 
-    for name, person_eid, bat_eid in members:
-        loc = state_of(person_eid)
-        if loc == "home":
-            loc_str, loc_color, happy = "Home", GREEN, True
-        elif loc == "not_home":
-            loc_str, loc_color, happy = "Away", ORANGE, False
+    for key in order:
+        data = members.get(key, {})
+        loc_state = data.get("state", "unknown")
+        loc_str   = (data.get("location") or "Unknown")[:23]
+        bat       = data.get("battery")
+        dist      = data.get("distance_miles")
+
+        if loc_state == "home":
+            loc_color = GREEN
+        elif loc_state == "not_home":
+            loc_color = ORANGE
         else:
-            loc_str, loc_color, happy = loc.replace("_", " ").title(), ACCENT, True
+            loc_color = DIM
 
         try:
-            bat_val = int(float(state_of(bat_eid, "--")))
+            bat_val = int(float(bat))
             bat_str = f"{bat_val}%"
             bat_color = GREEN if bat_val > 50 else YELLOW if bat_val > 20 else RED
-        except (ValueError, TypeError):
+        except (TypeError, ValueError):
             bat_val, bat_str, bat_color = 0, "--", DIM
 
+        try:
+            dist_str = f"{float(dist):.1f} mi"
+        except (TypeError, ValueError):
+            dist_str = "--"
+
         cy = y + ROW_H // 2
-        surf.blit(fonts["sm"].render(name, True, TEXT), (x, y + 3))
-        _draw_face(surf, x + 90, cy, happy, loc_color)
-        surf.blit(fonts["md"].render(loc_str, True, loc_color), (x + 103, y))
+        surf.blit(fonts["sm"].render(labels[key], True, TEXT), (x, y + 3))
+        surf.blit(fonts["md"].render(loc_str, True, loc_color), (x + 95, y))
+        surf.blit(fonts["sm"].render(dist_str, True, DIM), (DIST_X, y + 3))
         _draw_battery(surf, BAT_X - 26, cy - 5, bat_val, bat_color)
         surf.blit(fonts["sm"].render(bat_str, True, bat_color), (BAT_X, y + 3))
         y += ROW_H
@@ -386,6 +394,11 @@ def draw_family(surf, fonts, rect):
 def draw_calendar(surf, fonts, rect):
     draw_card(surf, fonts, rect, "UPCOMING EVENTS")
     x, y = rect.x + 10, rect.y + TITLE_H + 6
+
+    steam = state_of("sensor.steam_sales", "")
+    if steam and steam != "--":
+        s = fonts["sm"].render(f"Steam {steam}", True, ACCENT)
+        surf.blit(s, (rect.right - s.get_width() - 10, rect.y + 5))
 
     raw = state_of("sensor.upcoming_calendar_events", "")
     events = [e.strip() for e in raw.split("|") if e.strip()] if raw and raw != "--" else []
