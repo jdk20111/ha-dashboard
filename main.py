@@ -408,7 +408,7 @@ def draw_calendar(surf, fonts, rect):
         return
 
     max_w = rect.w - 20
-    for ev in events[:4]:
+    for ev in events[:5]:
         s = fonts["sm"].render(ev, True, TEXT)
         if s.get_width() > max_w:
             # Truncate with ellipsis
