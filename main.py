@@ -1,6 +1,8 @@
 import asyncio
 import math
 import os
+import signal
+import sys
 import threading
 import time
 from datetime import datetime
@@ -113,9 +115,9 @@ TITLE_H  = 26
 LINE_H   = 28
 
 # Header zones: [clock | forecast | current weather]
-FC_X0    = 230                       # forecast zone left edge
-FC_X1    = 790                       # forecast zone right edge
-FC_COL_W = (FC_X1 - FC_X0) // 3     # 186px per forecast column
+FC_X0    = 337                       # forecast zone left edge
+FC_X1    = 687                       # forecast zone right edge
+FC_COL_W = (FC_X1 - FC_X0) // 5     # 70px per forecast column (~30px gap between days)
 
 
 def card_rect(col: int, row: int) -> pygame.Rect:
@@ -203,11 +205,16 @@ def draw_header(surf: pygame.Surface, fonts: dict):
     surf.blit(fonts["sm"].render(time.strftime("%A, %B %-d", now), True, DIM), (PAD + 6, 62))
 
     # Right zone: current conditions
-    wx_state = state_of("weather.forecast_home", "")
+    wx_state = state_of("weather.pirateweather", "")
     wx_label = WEATHER_LABELS.get(wx_state, wx_state.replace("-", " ").title())
-    wx_temp  = attr_of("weather.forecast_home", "temperature")
-    wx_hum   = attr_of("weather.forecast_home", "humidity")
-    wx_wind  = attr_of("weather.forecast_home", "wind_speed")
+    wx_temp  = attr_of("weather.pirateweather", "temperature")
+    wx_hum   = attr_of("weather.pirateweather", "humidity")
+    wx_wind  = attr_of("weather.pirateweather", "wind_speed")
+
+    with _forecast_lock:
+        fc_today = _forecast[0] if _forecast else None
+    today_hi = fmt_temp(fc_today["temperature"]) if fc_today and "temperature" in fc_today else None
+    today_lo = fmt_temp(fc_today["templow"])      if fc_today and "templow"     in fc_today else None
 
     parts = [wx_label]
     if wx_temp is not None:
@@ -224,10 +231,14 @@ def draw_header(surf: pygame.Surface, fonts: dict):
     if wx_line2:
         s2 = fonts["sm"].render(wx_line2, True, DIM)
         surf.blit(s2, (SCREEN_WIDTH - s2.get_width() - PAD, 50))
+    if today_hi or today_lo:
+        wx_line3 = "  ".join(p for p in [f"Hi {today_hi}" if today_hi else "", f"Lo {today_lo}" if today_lo else ""] if p)
+        s3 = fonts["sm"].render(wx_line3, True, DIM)
+        surf.blit(s3, (SCREEN_WIDTH - s3.get_width() - PAD, 70))
 
-    # Center zone: 3-day forecast icons + hi/lo
+    # Center zone: 5-day forecast icons + hi/lo
     with _forecast_lock:
-        fc = _forecast[:3]
+        fc = _forecast[:5]
     for i, entry in enumerate(fc):
         cx = FC_X0 + i * FC_COL_W + FC_COL_W // 2
         try:
@@ -256,21 +267,15 @@ def draw_climate(surf, fonts, rect):
     up_temp = state_of("sensor.ecobee_upstairs_current_temperature")
     dn_temp = state_of("sensor.downstairs_temperature")
     hum     = state_of("sensor.ecobee_upstairs_current_humidity")
-    t_state = state_of("climate.ecobee_thermostat_thermostat")
-    t_act   = attr_of("climate.ecobee_thermostat_thermostat", "hvac_action", "")
-    t_lo    = attr_of("climate.ecobee_thermostat_thermostat", "target_temp_low")
-    t_hi    = attr_of("climate.ecobee_thermostat_thermostat", "target_temp_high")
+    t_lo = attr_of("climate.ecobee_thermostat_thermostat", "target_temp_low")
+    t_hi = attr_of("climate.ecobee_thermostat_thermostat", "target_temp_high")
 
     y = row(surf, fonts, x, y, "Upstairs",   fmt_temp(up_temp))
     y = row(surf, fonts, x, y, "Downstairs", fmt_temp(dn_temp))
     y = row(surf, fonts, x, y, "Humidity",   f"{hum}%")
 
-    tstat_val = t_state.replace("_", " ").title()
-    if t_act:
-        tstat_val += f" • {t_act}"
-    if t_lo and t_hi:
-        tstat_val += f"  ({t_lo}–{t_hi}°F)"
-    y = row(surf, fonts, x, y, "Thermostat", tstat_val, DIM)
+    tstat_val = f"{fmt_temp(t_lo)} – {fmt_temp(t_hi)}" if t_lo and t_hi else "--"
+    y = row(surf, fonts, x, y, "Set Range",  tstat_val)
 
 
 def draw_power(surf, fonts, rect):
@@ -292,7 +297,7 @@ def draw_power(surf, fonts, rect):
 
 
 def draw_security(surf, fonts, rect):
-    draw_card(surf, fonts, rect, "SECURITY & HOME")
+    draw_card(surf, fonts, rect, "HOME")
     x, y = rect.x + 10, rect.y + TITLE_H + 6
 
     garage = state_of("cover.garage_door")
@@ -313,41 +318,69 @@ def draw_security(surf, fonts, rect):
         ht_val += f"  ▲ heating"
     y = row(surf, fonts, x, y, "Hot Tub", ht_val)
 
-    vacuum = state_of("sensor.dusty_rhodes_station_state")
-    row(surf, fonts, x, y, "Dusty Rhodes", vacuum.title())
+    water_age = state_of("sensor.hot_tub_water_age")
+    y = row(surf, fonts, x, y, "Hot Tub Water Age", f"{water_age} days")
+
+    filter_age = state_of("sensor.furnace_filter_age")
+    row(surf, fonts, x, y, "Furnace Filter Age", f"{filter_age} days")
 
 
-def draw_printer(surf, fonts, rect):
-    draw_card(surf, fonts, rect, "3D PRINTER")
-    x, y = rect.x + 10, rect.y + TITLE_H + 6
-
-    status   = state_of("sensor.p1s_01p00c511600214_print_status")
-    progress = state_of("sensor.p1s_01p00c511600214_print_progress")
-    online   = state_of("binary_sensor.p1s_01p00c511600214_online")
-
-    o_color = GREEN if online == "on" else RED
-    y = row(surf, fonts, x, y, "Bambu P1S",
-            "Online" if online == "on" else "Offline", o_color)
-
-    s_color = ACCENT if status not in ("idle", "--", "unavailable") else DIM
-    y = row(surf, fonts, x, y, "Status", status.title(), s_color)
-
-    if status not in ("idle", "unavailable", "--"):
-        try:
-            pct = float(progress)
-            bar_w = rect.w - 24
-            bar_rect = pygame.Rect(x, y, bar_w, 14)
-            pygame.draw.rect(surf, CARD_HEAD, bar_rect, border_radius=4)
-            fill_w = int(bar_w * pct / 100)
-            if fill_w > 0:
-                pygame.draw.rect(surf, ACCENT,
-                                 pygame.Rect(x, y, fill_w, 14), border_radius=4)
-            y += 20
-            row(surf, fonts, x, y, "Progress", f"{pct:.0f}%", ACCENT)
-        except (TypeError, ValueError):
-            row(surf, fonts, x, y, "Progress", str(progress))
+def _draw_face(surf, cx, cy, happy, color):
+    r = 7
+    pygame.draw.circle(surf, color, (cx, cy), r, 1)
+    pygame.draw.circle(surf, color, (cx - 2, cy - 2), 1)
+    pygame.draw.circle(surf, color, (cx + 2, cy - 2), 1)
+    if happy:
+        pygame.draw.arc(surf, color, pygame.Rect(cx - 3, cy, 6, 4), math.pi, 2 * math.pi, 1)
     else:
-        row(surf, fonts, x, y, "Progress", "--", DIM)
+        pygame.draw.arc(surf, color, pygame.Rect(cx - 3, cy + 1, 6, 4), 0, math.pi, 1)
+
+
+def _draw_battery(surf, bx, by, pct, color):
+    pygame.draw.rect(surf, color, pygame.Rect(bx, by, 18, 10), 1)
+    pygame.draw.rect(surf, color, pygame.Rect(bx + 18, by + 3, 3, 4))
+    fill_w = max(1, int(16 * pct / 100))
+    pygame.draw.rect(surf, color, pygame.Rect(bx + 1, by + 1, fill_w, 8))
+
+
+def draw_family(surf, fonts, rect):
+    draw_card(surf, fonts, rect, "FAMILY")
+    x, y = rect.x + 10, rect.y + TITLE_H + 4
+
+    members = [
+        ("Jonathan", "person.jonathan", "sensor.dad_iphone_battery"),
+        ("Laura",    "person.laura",    "sensor.laura_kennedys_iphone_battery"),
+        ("Jonny",    "person.jonny",    "sensor.jonnys_iphone_battery"),
+        ("Bella",    "person.bella",    "sensor.bellas_iphone_battery"),
+        ("Andrew",   "person.andrew",   "sensor.mt_repairs_iphone_battery"),
+    ]
+
+    BAT_X  = rect.right - 50
+    ROW_H  = 25
+
+    for name, person_eid, bat_eid in members:
+        loc = state_of(person_eid)
+        if loc == "home":
+            loc_str, loc_color, happy = "Home", GREEN, True
+        elif loc == "not_home":
+            loc_str, loc_color, happy = "Away", ORANGE, False
+        else:
+            loc_str, loc_color, happy = loc.replace("_", " ").title(), ACCENT, True
+
+        try:
+            bat_val = int(float(state_of(bat_eid, "--")))
+            bat_str = f"{bat_val}%"
+            bat_color = GREEN if bat_val > 50 else YELLOW if bat_val > 20 else RED
+        except (ValueError, TypeError):
+            bat_val, bat_str, bat_color = 0, "--", DIM
+
+        cy = y + ROW_H // 2
+        surf.blit(fonts["sm"].render(name, True, TEXT), (x, y + 3))
+        _draw_face(surf, x + 90, cy, happy, loc_color)
+        surf.blit(fonts["md"].render(loc_str, True, loc_color), (x + 103, y))
+        _draw_battery(surf, BAT_X - 26, cy - 5, bat_val, bat_color)
+        surf.blit(fonts["sm"].render(bat_str, True, bat_color), (BAT_X, y + 3))
+        y += ROW_H
 
 
 def draw_calendar(surf, fonts, rect):
@@ -377,31 +410,50 @@ def draw_calendar(surf, fonts, rect):
 
 
 def draw_lights(surf, fonts, rect):
-    draw_card(surf, fonts, rect, "LIGHTS & SWITCHES")
+    draw_card(surf, fonts, rect, "LIGHTS")
     x, y = rect.x + 10, rect.y + TITLE_H + 6
 
     lights = [
-        ("Porch",       "light.porch_light"),
-        ("Landscape",   "light.landscape_lights"),
+        ("Garage 1",    "light.garage_light_center"),
+        ("Garage 2",    "light.shop_lights"),
+        ("Garage OL",   "light.garage_outside_light_left"),
+        ("Garage OR",   "light.garage_outdoor_light_right"),
         ("Kitchen Bar", "light.kitchen_bar_lights"),
         ("Kitchen Ctr", "light.kitchen_counter_lights"),
-        ("Shop",        "light.shop_lights"),
-        ("Garage",      "light.garage_light_center"),
+        ("Landscape",   "light.landscape_lights"),
+        ("LR Standing", "light.livingroom_standing_lamp"),
+        ("LR Table",    "light.livingroom_table_lamp"),
+        ("Master L",    "light.bedroom_lamp_laura"),
+        ("Master R",    "light.master_bedroom_lamp"),
+        ("Porch",       "light.porch_light"),
+        ("TV Light",    "light.tv_light"),
     ]
 
-    col2_x = rect.x + rect.w // 2
+    COLS = 3
+    ROWS = (len(lights) + COLS - 1) // COLS
+    COL_W = (rect.w - 10) // COLS
+    ROW_H = 22
+
     for i, (label, eid) in enumerate(lights):
-        lx = x if i % 2 == 0 else col2_x
-        ly = y + (i // 2) * LINE_H
+        col = i // ROWS
+        row = i % ROWS
+        lx = x + col * COL_W
+        ly = y + row * ROW_H
         st = state_of(eid)
         color = GREEN if st == "on" else DIM
-        dot = fonts["md"].render("●", True, color)
-        surf.blit(dot, (lx, ly))
-        surf.blit(fonts["sm"].render(label, True, TEXT if st == "on" else DIM),
-                  (lx + 18, ly + 4))
+        surf.blit(fonts["sm"].render("●", True, color), (lx, ly))
+        surf.blit(fonts["sm"].render(label, True, TEXT if st == "on" else DIM), (lx + 14, ly + 2))
 
 
 _fb_file = None
+
+def _tty_cursor(visible: bool):
+    seq = b'\033[?25h' if visible else b'\033[?25l'
+    try:
+        with open('/dev/tty1', 'wb') as tty:
+            tty.write(seq)
+    except OSError:
+        pass
 
 def _open_fb():
     global _fb_file
@@ -436,6 +488,7 @@ def draw_connecting(surf, fonts):
 # ---------------------------------------------------------------------------
 def main():
     _open_fb()
+    _tty_cursor(False)
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
     pygame.mouse.set_visible(False)
@@ -447,30 +500,36 @@ def main():
         "sm": pygame.font.SysFont("ubuntu,sans", 17),
     }
 
+    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+
     threading.Thread(target=ws_thread, daemon=True).start()
     clock = pygame.time.Clock()
 
-    while True:
-        screen.fill(BG)
+    try:
+        while True:
+            screen.fill(BG)
 
-        with _states_lock:
-            connected = _connected
+            with _states_lock:
+                connected = _connected
 
-        if not connected:
-            draw_connecting(screen, fonts)
-        else:
-            draw_header(screen, fonts)
-            draw_climate(screen,  fonts, card_rect(0, 0))
-            draw_power(screen,    fonts, card_rect(1, 0))
-            draw_security(screen, fonts, card_rect(0, 1))
-            draw_printer(screen,  fonts, card_rect(1, 1))
-            draw_calendar(screen, fonts, card_rect(0, 2))
-            draw_lights(screen,   fonts, card_rect(1, 2))
+            if not connected:
+                draw_connecting(screen, fonts)
+            else:
+                draw_header(screen, fonts)
+                draw_climate(screen,  fonts, card_rect(0, 0))
+                draw_power(screen,    fonts, card_rect(1, 0))
+                draw_security(screen, fonts, card_rect(0, 1))
+                draw_family(screen,   fonts, card_rect(1, 1))
+                draw_calendar(screen, fonts, card_rect(0, 2))
+                draw_lights(screen,   fonts, card_rect(1, 2))
 
-        _write_to_fb(screen)
-        clock.tick(10)
-
-    pygame.quit()
+            _write_to_fb(screen)
+            clock.tick(10)
+    finally:
+        pygame.quit()
+        if _fb_file:
+            _fb_file.close()
+        _tty_cursor(True)
 
 
 if __name__ == "__main__":

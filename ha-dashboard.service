@@ -8,9 +8,12 @@ Type=simple
 User=jdk201
 WorkingDirectory=/home/jdk201/ha-dashboard
 EnvironmentFile=/home/jdk201/ha-dashboard/.env
+ExecStartPre=+/bin/sh -c 'printf "\\033[?25l" > /dev/tty1'
 ExecStart=/usr/bin/python3 /home/jdk201/ha-dashboard/main.py
+ExecStopPost=+/bin/sh -c 'printf "\\033[?25h" > /dev/tty1'
 Restart=always
 RestartSec=10
+TimeoutStopSec=5
 Environment=SDL_VIDEODRIVER=offscreen
 Environment=SDL_AUDIODRIVER=dummy
 

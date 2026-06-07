@@ -5,7 +5,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-WEATHER_ENTITY = "weather.forecast_home"
+WEATHER_ENTITY = "weather.pirateweather"
 
 
 class HAClient:
