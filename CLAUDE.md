@@ -55,7 +55,7 @@ sudo systemctl daemon-reload
 
 The app has two threads:
 
-1. **WebSocket thread** (`ws_thread` → `HAClient.run`): Connects to HA at `HA_WS_URL`, fetches a full state snapshot on connect, then subscribes to `state_changed` events. On each event, it merges the new state into `self.states` and calls `on_state_change(self.states)` — passing the **full** states dict every time, not a diff. `on_state_change` in `main.py` replaces `_states` under `_states_lock` and sets `_connected = True`. Reconnects automatically on failure with a 5-second backoff.
+1. **WebSocket thread** (`ws_thread` → `HAClient.run`): Connects to HA at `HA_WS_URL`, fetches a full state snapshot on connect, then subscribes to `state_changed` events. On each event, it merges the new state into `self.states` and calls `on_state_change(self.states, entity_id)` — passing the **full** states dict every time (not a diff) and the ID of the entity that changed. `on_state_change` in `main.py` replaces `_states` under `_states_lock` and sets `_connected = True`. Reconnects automatically on failure with a 5-second backoff.
 
 2. **Pygame main loop** (`main`): Polls at 4 FPS but rendering is **event-driven** via `_dirty` (a `threading.Event`). A frame is only drawn when `_dirty` is set *and* at least 1 second has elapsed since the last render. `_dirty` is set by: `on_state_change` (only for entities listed in `_WATCHED_ENTITIES`, or `None` on initial snapshot load), `on_forecast`, and the main loop itself once per minute (to tick the clock). **When adding a new entity to a card, add it to `_WATCHED_ENTITIES` in `main.py` or state changes for that entity will silently skip re-renders.** If `_connected` is False, shows a connecting splash instead.
 
@@ -89,6 +89,8 @@ The screen is divided into a fixed header (`HDR_H = 90px`) and a 2-column × 3-r
 | `card_rect(0, 2)` | `draw_calendar` |
 | `card_rect(1, 2)` | `draw_lights` |
 
+Current card contents: `draw_climate` — upstairs/downstairs temp, humidity, thermostat set range, hot tub (5 rows). `draw_system_status` — HA/Docker/Mac Mini/Pi health, network speed+clients (5 rows). `draw_security` (titled "HOME") — garage door, waterfall level, hot tub water age, furnace filter age, coffee filter age (5 rows). `draw_family` — per-member location/battery/distance (5 rows). `draw_calendar` — upcoming calendar events. `draw_lights` — 13 lights in 3 columns.
+
 **Adding a new card**: write a `draw_*` function, call it from `main()`, and add any new entity IDs to `_WATCHED_ENTITIES`. Use `draw_card()` for the card background/header, then `row()` for content:
 
 ```python
@@ -98,7 +100,9 @@ def row(surf, fonts, x, y, label, value, val_color=TEXT, label_w=160) -> int:
 
 **Row spacing**: each card has 128px of content (CARD_H=154 − TITLE_H=26). `LINE_H=28` is the default but cards with 5 rows use a manual `y += 25` instead of the `row()` return value to fit without clipping. Cards with 4 rows use `y += 30` to fill the space evenly. Don't rely on `LINE_H` — check the math for the target card.
 
-**Colors**: `DIM = (255,255,255)` (white) is used for secondary/label text everywhere. `LIGHTS_DIM = (100,112,148)` (gray) is reserved for off-state indicators in the lights panel only. `ACCENT = (70,150,255)` (blue) is used for card titles and right-justified header annotations (e.g. Public IP, Steam sales).
+**Header annotations**: several cards render right-justified text in the title bar (same `y + 5`, `rect.right - width - 10` pattern): System Status shows Public IP, Calendar shows Steam sales, Family shows "Best Family of All Time!" (hard-coded), Lights shows next sunrise or sunset time from `sun.sun` (switches based on `sun.sun` state: `above_horizon` → next_setting, `below_horizon` → next_rising; parsed from UTC ISO via `datetime.fromisoformat().astimezone()`).
+
+**Colors**: `TEXT = (210,218,235)` (light blue-white) is the default value color in `row()` and general content. `DIM = (255,255,255)` (white) is used for label text and secondary content. `LIGHTS_DIM = (100,112,148)` (gray) is reserved for off-state indicators in the lights panel only. `ACCENT = (70,150,255)` (blue) is used for card titles and right-justified header annotations. Status values use `GREEN`/`YELLOW`/`RED`/`ORANGE` directly.
 
 **Font sizes** (Ubuntu/sans): `xl`=52 bold, `lg`=34 bold, `md`=22, `sm`=17.
 

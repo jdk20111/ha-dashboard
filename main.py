@@ -35,7 +35,7 @@ _WATCHED_ENTITIES = {
     "light.porch_light", "light.shop_lights", "light.tv_light",
     "sensor.downstairs_temperature", "sensor.ecobee_upstairs_current_humidity",
     "sensor.ecobee_upstairs_current_temperature", "sensor.family_locations",
-    "sensor.furnace_filter_age", "sensor.hot_tub_water_age",
+    "sensor.coffee_filter_age", "sensor.furnace_filter_age", "sensor.hot_tub_water_age",
     "sensor.docker_env_health", "sensor.ha_health",
     "sensor.m5_download_speed", "sensor.m5_upload_speed",
     "sensor.mac_mini_health", "sensor.pi_health",
@@ -43,6 +43,7 @@ _WATCHED_ENTITIES = {
     "sensor.tp_link_router_total_clients",
     "sensor.upcoming_calendar_events", "sensor.water_tank_level",
     "sensor.xcel_itron_instantaneous_demand_value",
+    "sun.sun",
     "weather.pirateweather",
 }
 
@@ -282,7 +283,7 @@ def draw_header(surf: pygame.Surface, fonts: dict):
 
 def draw_climate(surf, fonts, rect):
     draw_card(surf, fonts, rect, "CLIMATE")
-    x, y = rect.x + 10, rect.y + TITLE_H + 8
+    x, y = rect.x + 10, rect.y + TITLE_H + 3
 
     up_temp = state_of("sensor.ecobee_upstairs_current_temperature")
     dn_temp = state_of("sensor.downstairs_temperature")
@@ -298,7 +299,17 @@ def draw_climate(surf, fonts, rect):
         ("Set Range",  tstat_val),
     ]:
         row(surf, fonts, x, y, label, value)
-        y += 30
+        y += 25
+
+    ht_temp = attr_of("climate.hottub", "current_temperature")
+    ht_set  = attr_of("climate.hottub", "temperature")
+    ht_act  = attr_of("climate.hottub", "hvac_action", "")
+    ht_val  = fmt_temp(ht_temp)
+    if ht_set:
+        ht_val += f"  (set {fmt_temp(ht_set)})"
+    if ht_act and ht_act != "off":
+        ht_val += f"  ▲ heating"
+    row(surf, fonts, x, y, "Hot Tub", ht_val)
 
 
 def draw_system_status(surf, fonts, rect):
@@ -343,23 +354,16 @@ def draw_security(surf, fonts, rect):
     row(surf, fonts, x, y, "Waterfall", water)
     y += 25
 
-    ht_temp = attr_of("climate.hottub", "current_temperature")
-    ht_set  = attr_of("climate.hottub", "temperature")
-    ht_act  = attr_of("climate.hottub", "hvac_action", "")
-    ht_val  = fmt_temp(ht_temp)
-    if ht_set:
-        ht_val += f"  (set {fmt_temp(ht_set)})"
-    if ht_act and ht_act != "off":
-        ht_val += f"  ▲ heating"
-    row(surf, fonts, x, y, "Hot Tub", ht_val)
-    y += 25
-
     water_age = state_of("sensor.hot_tub_water_age")
     row(surf, fonts, x, y, "Hot Tub Water Age", f"{water_age} days")
     y += 25
 
     filter_age = state_of("sensor.furnace_filter_age")
     row(surf, fonts, x, y, "Furnace Filter Age", f"{filter_age} days")
+    y += 25
+
+    coffee_age = state_of("sensor.coffee_filter_age")
+    row(surf, fonts, x, y, "Coffee Filter Age", f"{coffee_age} days")
 
 
 def _draw_face(surf, cx, cy, happy, color):
@@ -385,6 +389,8 @@ def _draw_battery(surf, bx, by, pct, color, charging=False):
 
 def draw_family(surf, fonts, rect):
     draw_card(surf, fonts, rect, "FAMILY")
+    s = fonts["sm"].render("Best Family of All Time!", True, ACCENT)
+    surf.blit(s, (rect.right - s.get_width() - 10, rect.y + 5))
     x, y = rect.x + 10, rect.y + TITLE_H + 4
 
     order  = ["jonathan", "laura", "jonny", "bella", "andrew"]
@@ -472,6 +478,20 @@ def _draw_bulb(surf, x, y, on):
 
 def draw_lights(surf, fonts, rect):
     draw_card(surf, fonts, rect, "LIGHTS")
+
+    sun_state = state_of("sun.sun", "")
+    if sun_state == "above_horizon":
+        sun_label, sun_attr = "Sunset", "next_setting"
+    else:
+        sun_label, sun_attr = "Sunrise", "next_rising"
+    sun_t = attr_of("sun.sun", sun_attr)
+    try:
+        sun_str = datetime.fromisoformat(sun_t).astimezone().strftime("%-I:%M %p")
+    except (TypeError, ValueError):
+        sun_str = "--"
+    s = fonts["sm"].render(f"{sun_label} {sun_str}", True, ACCENT)
+    surf.blit(s, (rect.right - s.get_width() - 10, rect.y + 5))
+
     x, y = rect.x + 10, rect.y + TITLE_H + 3
 
     lights = [
