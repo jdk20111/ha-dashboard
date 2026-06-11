@@ -8,8 +8,12 @@ import time
 from datetime import datetime
 import numpy as np
 import pygame
-from config import HA_WS_URL, HA_TOKEN, SCREEN_WIDTH, SCREEN_HEIGHT
+from config import (
+    HA_WS_URL, HA_TOKEN, SCREEN_WIDTH, SCREEN_HEIGHT,
+    SLIDESHOW_ACTIVE, SLIDESHOW_DASHBOARD_SECONDS, SLIDESHOW_PHOTO_SECONDS,
+)
 from ha_client import HAClient
+from photos import PhotoProvider
 
 os.environ.setdefault("SDL_VIDEODRIVER", "offscreen")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -639,6 +643,15 @@ def draw_connecting(surf, fonts):
                   SCREEN_HEIGHT // 2 - s.get_height() // 2))
 
 
+def draw_photo(surf, photo):
+    """Blit a slideshow photo centered on a BG fill. The photo is already
+    scaled to fit within the canvas by the photo provider; _write_to_fb then
+    scales the canvas to the panel as usual."""
+    surf.fill(BG)
+    surf.blit(photo, ((SCREEN_WIDTH - photo.get_width()) // 2,
+                      (SCREEN_HEIGHT - photo.get_height()) // 2))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -659,9 +672,21 @@ def main():
     signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
 
     threading.Thread(target=ws_thread, daemon=True).start()
+
+    # Photo slideshow: when active, a background thread fetches photos and the
+    # main loop alternates between the dashboard and a full-screen photo.
+    photos = None
+    cycle_len = SLIDESHOW_DASHBOARD_SECONDS + SLIDESHOW_PHOTO_SECONDS
+    if SLIDESHOW_ACTIVE:
+        photos = PhotoProvider()
+        threading.Thread(target=photos.run, daemon=True).start()
+
     clock = pygame.time.Clock()
     _last_minute = -1
     _last_render = 0.0
+    _phase = "dashboard"
+    _photo_surf = None
+    _cycle_start = time.monotonic()
 
     try:
         while True:
@@ -671,6 +696,19 @@ def main():
                 _last_minute = now.tm_min
 
             mono = time.monotonic()
+
+            # Slideshow phase: dashboard for the first part of the cycle, photo
+            # for the rest. On entering the photo phase, pick a fresh random
+            # photo; if none is cached yet, we fall back to the dashboard.
+            if photos is not None:
+                pos = (mono - _cycle_start) % cycle_len
+                phase = "photo" if pos >= SLIDESHOW_DASHBOARD_SECONDS else "dashboard"
+                if phase != _phase:
+                    _phase = phase
+                    if phase == "photo":
+                        _photo_surf = photos.next_surface()
+                    _dirty.set()
+
             if _dirty.is_set() and (mono - _last_render) >= 1.0:
                 _dirty.clear()
                 _last_render = mono
@@ -681,6 +719,8 @@ def main():
 
                 if not connected:
                     draw_connecting(screen, fonts)
+                elif _phase == "photo" and _photo_surf is not None:
+                    draw_photo(screen, _photo_surf)
                 else:
                     draw_header(screen, fonts)
                     draw_climate(screen,  fonts, card_rect(0, 0))

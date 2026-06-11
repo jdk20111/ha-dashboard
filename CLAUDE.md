@@ -16,7 +16,7 @@ A fullscreen pygame dashboard that displays live Home Assistant sensor data. It 
 | Display | 1024×600, 16bpp RGB565 | 1920×1080, 32bpp BGRX |
 | Safe margin | none (`.env` omits it) | `FB_SAFE_MARGIN_X=0.03`, `FB_SAFE_MARGIN_Y=0.04` |
 | Repo path | `~/ha-dashboard` | `~/repos/ha-dashboard` (symlinked to `~/ha-dashboard`) |
-| Code changes | made here, pushed to origin | pulled automatically every 10 min via `ha-dashboard-update` timer |
+| Code changes | made here, pushed to origin | pulled automatically every 1 hour via `ha-dashboard-update` timer |
 | Dependencies | pip | apt |
 
 The framebuffer layer auto-adapts to the panel's size/depth/stride and scales the canvas to fit (see "Display path").
@@ -57,13 +57,62 @@ sudo systemctl daemon-reload
 
 ## Architecture
 
-The app has two threads:
+The app has two threads (three when the photo slideshow is active — see "Photo slideshow"):
 
 1. **WebSocket thread** (`ws_thread` → `HAClient.run`): Connects to HA at `HA_WS_URL`, fetches a full state snapshot on connect, then subscribes to `state_changed` events. On each event, it merges the new state into `self.states` and calls `on_state_change(self.states)` — passing the **full** states dict every time, not a diff. `on_state_change` in `main.py` replaces `_states` under `_states_lock` and sets `_connected = True`. Reconnects automatically on failure with a 5-second backoff.
 
 2. **Pygame main loop** (`main`): Polls at 4 FPS but rendering is **event-driven** via `_dirty` (a `threading.Event`). A frame is only drawn when `_dirty` is set *and* at least 1 second has elapsed since the last render. `_dirty` is set by: `on_state_change` (only for entities listed in `_WATCHED_ENTITIES`, or `None` on initial snapshot load), `on_forecast`, and the main loop itself once per minute (to tick the clock). **When adding a new entity to a card, add it to `_WATCHED_ENTITIES` in `main.py` or state changes for that entity will silently skip re-renders.** If `_connected` is False, shows a connecting splash instead.
 
 **Forecast data** flows via a separate `on_forecast` callback and `_forecast_lock`. `HAClient` requests forecast on connect (via `call_service weather.get_forecasts`) and re-requests whenever `weather.pirateweather` changes. Message IDs 1 and 2 are reserved for the handshake/subscription; dynamic requests start at 3.
+
+## Photo slideshow
+
+When enabled, the dashboard alternates between the normal card view and a
+full-screen photo. The main loop (`main()`) runs a 2-phase state machine driven
+by `time.monotonic()`: `pos = (now - start) % (dash_s + photo_s)` selects
+`dashboard` vs `photo`. On entering the photo phase it pulls a random cached
+surface via `PhotoProvider.next_surface()`; **if no photo is cached yet (or the
+slideshow is off) it falls back to the dashboard**, so the screen is never blank.
+
+`photos.py` (`PhotoProvider`) runs on its own daemon thread, mirroring
+`HAClient`'s resilient loop. It recursively scans `PHOTO_DIR` for image files
+(`.jpg/.jpeg/.png/.bmp/.gif`), re-scanning every `PHOTO_RESCAN_MINUTES`, and
+keeps `PHOTO_CACHE_SIZE` decoded, aspect-fitted pygame surfaces in an in-memory
+deque. Once full it swaps in one fresh photo per tick so the set rotates over
+time. Unreadable/undecodable files are skipped (e.g. `.MOV`/`.HEIC` mixed into
+the folder), and a missing directory (an unmounted network share) just yields
+no photos — the dashboard keeps running. Uses only the stdlib + pygame's
+built-in image decode — **no new apt/pip packages**.
+
+**Source**: `PHOTO_DIR` is a local or network-mounted folder you populate
+yourself. Google restricted its Photos APIs in 2025 (the legacy Library API's
+`photoslibrary.readonly` scope 403s; the Ambient API requires the commercial
+Partner Program), so there is no self-serve way for a personal app to auto-pull
+a user's library. Reading a folder off a network drive sidesteps all of that and
+needs no API, OAuth, or network credentials at display time. On `macmini1` the
+photos live on the HA box's Samba share `//192.168.68.151/iCloud-Photos`
+(anonymous/guest, organized `YEAR/MONTH/`); mount it (see "Deployment") and point
+`PHOTO_DIR` at the mount. Note HEIC isn't decoded by SDL_image — keep displayed
+photos as JPEG/PNG.
+
+**Config** (`config.py`, all env-overridable in `.env`):
+
+| Var | Default | Purpose |
+|---|---|---|
+| `SLIDESHOW_ENABLED` | `1` | Set `0` to disable (the Pi's off-switch) |
+| `SLIDESHOW_DASHBOARD_SECONDS` | `20` | Dashboard phase length |
+| `SLIDESHOW_PHOTO_SECONDS` | `20` | Photo phase length |
+| `PHOTO_DIR` | — | Folder (recursively) scanned for images |
+| `PHOTO_RESCAN_MINUTES` | `10` | How often to re-scan the folder |
+| `PHOTO_CACHE_SIZE` | `8` | Decoded surfaces held in RAM |
+
+`SLIDESHOW_ACTIVE` (derived) is true only when enabled **and** `PHOTO_DIR` is
+set; otherwise the dashboard runs exactly as before.
+
+The Pi 3 B handles this fine (light bursty workload), but its 16bpp panel shows
+mild color banding in gradients; disable with `SLIDESHOW_ENABLED=0` in its
+`.env` if desired. Photos are read off the network drive and decoded on the
+background thread, so the render loop never stalls.
 
 ## Display path
 
@@ -93,6 +142,12 @@ The screen is divided into a fixed header (`HDR_H = 90px`) and a 2-column × 3-r
 | `card_rect(0, 2)` | `draw_calendar` |
 | `card_rect(1, 2)` | `draw_lights` |
 
+**Header zones**: `draw_header` has three horizontal zones. Left (0–337px): clock (`xl` font) + date (`sm`). Center (FC_X0=337 to FC_X1=687): 5-day forecast icons with day label, weather icon, hi (`ORANGE`), lo (`ACCENT`). Right (687–1024px): current condition label + temp (`lg`), then humidity/wind and today's hi/lo (`sm`). The `draw_wx_icon` function draws simple geometric icons for each HA weather condition string.
+
+**Unrendered entity**: `sensor.xcel_itron_instantaneous_demand_value` is in `_WATCHED_ENTITIES` but no card currently renders it. It is tracked so a future energy card can be added without missing updates.
+
+**Dead code**: `_draw_face()` in `main.py` is defined but not called from any card. It can be removed if a cleanup is done.
+
 **Adding a new card**: write a `draw_*` function, call it from `main()`, and add any new entity IDs to `_WATCHED_ENTITIES`. Use `draw_card()` for the card background/header, then `row()` for content:
 
 ```python
@@ -102,7 +157,7 @@ def row(surf, fonts, x, y, label, value, val_color=TEXT, label_w=160) -> int:
 
 **Row spacing**: each card has 128px of content (CARD_H=154 − TITLE_H=26). `LINE_H=28` is the default but cards with 5 rows use a manual `y += 25` instead of the `row()` return value to fit without clipping. Cards with 4 rows use `y += 30` to fill the space evenly. Don't rely on `LINE_H` — check the math for the target card.
 
-**Colors**: `DIM = (255,255,255)` (white) is used for secondary/label text everywhere. `LIGHTS_DIM = (100,112,148)` (gray) is reserved for off-state indicators in the lights panel only. `ACCENT = (70,150,255)` (blue) is used for card titles and right-justified header annotations (e.g. Public IP, Steam sales). Health sensor values map to `GREEN`/`YELLOW`/`RED` via `STATUS_COLOR = {"healthy": GREEN, "warning": YELLOW, "critical": RED}`.
+**Colors**: `DIM = (255,255,255)` (white) is used for secondary/label text everywhere. `LIGHTS_DIM = (100,112,148)` (gray) is reserved for off-state indicators in the lights panel only. `ACCENT = (70,150,255)` (blue) is used for card titles and right-justified header annotations (e.g. Public IP, Steam sales). `ORANGE = (255,160,40)` is used for garage door open, family "not_home" state, and forecast hi temperatures. Health sensor values map to `GREEN`/`YELLOW`/`RED` via `STATUS_COLOR = {"healthy": GREEN, "warning": YELLOW, "critical": RED}`.
 
 **Font sizes** (Ubuntu/sans): `xl`=52 bold, `lg`=34 bold, `md`=22, `sm`=17.
 
