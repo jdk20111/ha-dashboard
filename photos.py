@@ -14,6 +14,7 @@ import random
 import threading
 import time
 from collections import deque
+from datetime import datetime
 
 import pygame
 
@@ -40,18 +41,41 @@ def _fit(surface: pygame.Surface) -> pygame.Surface:
     return pygame.transform.smoothscale(surface, (max(1, int(w * scale)), max(1, int(h * scale))))
 
 
+def _extract_date(path: str) -> str:
+    """Return the file's mtime formatted as M/D/YYYY, or '' on error."""
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(path)).strftime("%-m/%-d/%Y")
+    except OSError:
+        return ""
+
+
+def _extract_number(path: str) -> str:
+    """Return the numeric portion of a filename like 000042.jpg as '42', or ''."""
+    name = os.path.splitext(os.path.basename(path))[0]
+    return str(int(name)) if name.isdigit() else ""
+
+
 class PhotoProvider:
     def __init__(self):
         self._files: list[str] = []
         self._files_scanned = 0.0                      # monotonic of last scan
-        self._cache: deque[pygame.Surface] = deque(maxlen=PHOTO_CACHE_SIZE)
+        self._cache: deque[tuple[pygame.Surface, str, str]] = deque(maxlen=PHOTO_CACHE_SIZE)
+        self._queue: list[int] = []   # shuffled indices into _cache; refilled when exhausted
         self._lock = threading.Lock()
 
     # -- public API (main thread) ------------------------------------------
-    def next_surface(self) -> pygame.Surface | None:
-        """Return a random cached photo surface, or None if none ready yet."""
+    def next_surface(self) -> tuple[pygame.Surface, str, str] | None:
+        """Return the next (surface, date, number) from a shuffle deck; no repeats until all shown."""
         with self._lock:
-            return random.choice(self._cache) if self._cache else None
+            if not self._cache:
+                return None
+            snapshot = list(self._cache)
+            if len(self._queue) != len(snapshot):
+                # Cache grew or shrank — rebuild deck, keeping remaining unseen indices where valid
+                self._queue = list(range(len(snapshot)))
+                random.shuffle(self._queue)
+            idx = self._queue.pop()
+            return snapshot[idx]
 
     # -- background loop ---------------------------------------------------
     def run(self):
@@ -104,5 +128,5 @@ class PhotoProvider:
                 logger.warning(f"skipping {path}: {e}")
                 continue
             with self._lock:
-                self._cache.append(surface)
+                self._cache.append((surface, _extract_date(path), _extract_number(path)))
             return

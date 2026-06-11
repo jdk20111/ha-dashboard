@@ -17,8 +17,9 @@ SCREEN_HEIGHT = 600
 # like (e.g. a network drive synced from Google Photos, a Takeout export, or a
 # manual copy). Disabled when PHOTO_DIR is unset, or via SLIDESHOW_ENABLED=0.
 SLIDESHOW_ENABLED = os.environ.get("SLIDESHOW_ENABLED", "1") != "0"
-SLIDESHOW_DASHBOARD_SECONDS = float(os.environ.get("SLIDESHOW_DASHBOARD_SECONDS", "20"))
-SLIDESHOW_PHOTO_SECONDS = float(os.environ.get("SLIDESHOW_PHOTO_SECONDS", "20"))
+SLIDESHOW_DASHBOARD_SECONDS = float(os.environ.get("SLIDESHOW_DASHBOARD_SECONDS", "15"))
+SLIDESHOW_PHOTO_COUNT       = int(os.environ.get("SLIDESHOW_PHOTO_COUNT", "5"))
+SLIDESHOW_PHOTO_SECONDS     = float(os.environ.get("SLIDESHOW_PHOTO_SECONDS", "5"))
 
 # Directory to scan (recursively) for photos. May be a network mount.
 PHOTO_DIR = os.environ.get("PHOTO_DIR", "")

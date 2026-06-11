@@ -10,7 +10,7 @@ import numpy as np
 import pygame
 from config import (
     HA_WS_URL, HA_TOKEN, SCREEN_WIDTH, SCREEN_HEIGHT,
-    SLIDESHOW_ACTIVE, SLIDESHOW_DASHBOARD_SECONDS, SLIDESHOW_PHOTO_SECONDS,
+    SLIDESHOW_ACTIVE, SLIDESHOW_DASHBOARD_SECONDS, SLIDESHOW_PHOTO_COUNT, SLIDESHOW_PHOTO_SECONDS,
 )
 from ha_client import HAClient
 from photos import PhotoProvider
@@ -106,6 +106,7 @@ def fmt_speed(entity_id: str) -> str:
         return "--"
 
 
+
 WEATHER_LABELS = {
     "sunny": "Sunny", "clear-night": "Clear", "partlycloudy": "Partly Cloudy",
     "cloudy": "Cloudy", "fog": "Foggy", "hail": "Hail",
@@ -143,6 +144,8 @@ LINE_H   = 28
 FC_X0    = 337                       # forecast zone left edge
 FC_X1    = 687                       # forecast zone right edge
 FC_COL_W = (FC_X1 - FC_X0) // 5     # 70px per forecast column (~30px gap between days)
+
+FADE_DURATION = 1.5  # seconds for phase-transition crossfade
 
 
 def card_rect(col: int, row: int) -> pygame.Rect:
@@ -545,12 +548,13 @@ FB_SAFE_MARGIN   = float(os.environ.get("FB_SAFE_MARGIN", "0"))
 FB_SAFE_MARGIN_X = os.environ.get("FB_SAFE_MARGIN_X")
 FB_SAFE_MARGIN_Y = os.environ.get("FB_SAFE_MARGIN_Y")
 
-_fb_file   = None
-_fb_w      = SCREEN_WIDTH
-_fb_h      = SCREEN_HEIGHT
-_fb_bpp    = 16
-_fb_stride = SCREEN_WIDTH * 2
-_dst       = (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)   # (x, y, w, h) of canvas within fb
+_fb_file        = None
+_fb_w           = SCREEN_WIDTH
+_fb_h           = SCREEN_HEIGHT
+_fb_bpp         = 16
+_fb_stride      = SCREEN_WIDTH * 2
+_dst            = (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)   # (x, y, w, h) of canvas within fb
+_fb_surf_native = None   # 16bpp blit target for fast RGB565 conversion
 
 def _tty_cursor(visible: bool):
     seq = b'\033[?25h' if visible else b'\033[?25l'
@@ -609,8 +613,28 @@ def _compose_rgb(surface: pygame.Surface):
     return full
 
 def _write_to_fb(surface: pygame.Surface):
+    global _fb_surf_native
     if _fb_file is None:
         return
+    dx, dy, dw, dh = _dst
+    # Fast path: 16bpp with no letterboxing and no stride padding.
+    # Blit to a native RGB565 surface (SDL C code does the conversion) and
+    # write the raw buffer directly — avoids the slow numpy packing entirely.
+    if (_fb_bpp == 16 and dx == 0 and dy == 0
+            and dw == _fb_w and dh == _fb_h
+            and (_fb_stride == 0 or _fb_stride == _fb_w * 2)):
+        if _fb_surf_native is None:
+            # R=0xF800 G=0x07E0 B=0x001F — standard RGB565 little-endian
+            _fb_surf_native = pygame.Surface(
+                (_fb_w, _fb_h), 0, 16, (0xF800, 0x07E0, 0x001F, 0))
+        src = surface if (SCREEN_WIDTH, SCREEN_HEIGHT) == (_fb_w, _fb_h) else \
+              pygame.transform.smoothscale(surface, (_fb_w, _fb_h))
+        _fb_surf_native.blit(src, (0, 0))
+        _fb_file.seek(0)
+        _fb_file.write(_fb_surf_native.get_buffer())
+        _fb_file.flush()
+        return
+    # General path: numpy handles 32bpp, letterboxing, and stride padding.
     rgb = _compose_rgb(surface)                                  # (H, W, 3) RGB
     h, w = rgb.shape[:2]
     if _fb_bpp == 16:
@@ -643,13 +667,34 @@ def draw_connecting(surf, fonts):
                   SCREEN_HEIGHT // 2 - s.get_height() // 2))
 
 
-def draw_photo(surf, photo):
-    """Blit a slideshow photo centered on a BG fill. The photo is already
-    scaled to fit within the canvas by the photo provider; _write_to_fb then
-    scales the canvas to the panel as usual."""
+def _draw_label_pill(surf: pygame.Surface, fonts: dict, text: str, x: int, y: int):
+    """Draw a semi-transparent pill with text at (x, y) = top-left of the pill."""
+    label = fonts["md"].render(text, True, (240, 240, 240))
+    lw, lh = label.get_size()
+    pad = 8
+    pill = pygame.Surface((lw + pad * 2, lh + pad * 2), pygame.SRCALPHA)
+    pill.fill((0, 0, 0, 150))
+    surf.blit(pill, (x, y))
+    surf.blit(label, (x + pad, y + pad))
+
+
+def draw_photo(surf: pygame.Surface, fonts: dict, photo: pygame.Surface,
+               date: str, number: str):
+    """Render photo centered on BG fill with date (bottom-right) and number (bottom-left) overlays."""
     surf.fill(BG)
     surf.blit(photo, ((SCREEN_WIDTH - photo.get_width()) // 2,
                       (SCREEN_HEIGHT - photo.get_height()) // 2))
+    pad = 8
+    margin = 16
+    if date:
+        text = fonts["md"].render(date, True, (240, 240, 240))
+        tw, th = text.get_size()
+        ox = SCREEN_WIDTH - tw - pad * 2 - margin
+        oy = SCREEN_HEIGHT - th - pad * 2 - margin
+        _draw_label_pill(surf, fonts, date, ox, oy)
+    if number:
+        oy = SCREEN_HEIGHT - fonts["md"].size(number)[1] - pad * 2 - margin
+        _draw_label_pill(surf, fonts, number, margin, oy)
 
 
 # ---------------------------------------------------------------------------
@@ -674,9 +719,11 @@ def main():
     threading.Thread(target=ws_thread, daemon=True).start()
 
     # Photo slideshow: when active, a background thread fetches photos and the
-    # main loop alternates between the dashboard and a full-screen photo.
+    # main loop shows SLIDESHOW_PHOTO_COUNT photos (SLIDESHOW_PHOTO_SECONDS each)
+    # then the dashboard for SLIDESHOW_DASHBOARD_SECONDS, then repeats.
     photos = None
-    cycle_len = SLIDESHOW_DASHBOARD_SECONDS + SLIDESHOW_PHOTO_SECONDS
+    photo_total = SLIDESHOW_PHOTO_COUNT * SLIDESHOW_PHOTO_SECONDS
+    cycle_len = photo_total + SLIDESHOW_DASHBOARD_SECONDS
     if SLIDESHOW_ACTIVE:
         photos = PhotoProvider()
         threading.Thread(target=photos.run, daemon=True).start()
@@ -686,6 +733,12 @@ def main():
     _last_render = 0.0
     _phase = "dashboard"
     _photo_surf = None
+    _photo_year = ""
+    _photo_number = ""
+    _photo_index = -1        # which slot in the photo sequence (0..COUNT-1), -1 = dashboard
+    _fade_surf: pygame.Surface | None = None
+    _fade_start = 0.0
+    _in_transition = False
     _cycle_start = time.monotonic()
 
     try:
@@ -697,19 +750,37 @@ def main():
 
             mono = time.monotonic()
 
-            # Slideshow phase: dashboard for the first part of the cycle, photo
-            # for the rest. On entering the photo phase, pick a fresh random
-            # photo; if none is cached yet, we fall back to the dashboard.
+            # Slideshow cycle: PHOTO_COUNT photos (PHOTO_SECONDS each) then dashboard.
             if photos is not None:
                 pos = (mono - _cycle_start) % cycle_len
-                phase = "photo" if pos >= SLIDESHOW_DASHBOARD_SECONDS else "dashboard"
-                if phase != _phase:
-                    _phase = phase
-                    if phase == "photo":
-                        _photo_surf = photos.next_surface()
+                if pos < photo_total:
+                    new_phase = "photo"
+                    new_idx = int(pos / SLIDESHOW_PHOTO_SECONDS)
+                else:
+                    new_phase = "dashboard"
+                    new_idx = -1
+
+                if new_phase != _phase or new_idx != _photo_index:
+                    _fade_surf = screen.copy()
+                    _fade_start = mono
+                    _in_transition = True
+                    _phase = new_phase
+                    _photo_index = new_idx
+                    if new_phase == "photo":
+                        result = photos.next_surface()
+                        if result:
+                            _photo_surf, _photo_year, _photo_number = result
+                        else:
+                            _photo_surf = None
+                            _photo_year = ""
+                            _photo_number = ""
                     _dirty.set()
 
-            if _dirty.is_set() and (mono - _last_render) >= 1.0:
+            # Crossfade needs per-tick re-renders
+            if _in_transition:
+                _dirty.set()
+
+            if _dirty.is_set() and (mono - _last_render) >= (0.0 if _in_transition else 1.0):
                 _dirty.clear()
                 _last_render = mono
                 screen.fill(BG)
@@ -720,7 +791,7 @@ def main():
                 if not connected:
                     draw_connecting(screen, fonts)
                 elif _phase == "photo" and _photo_surf is not None:
-                    draw_photo(screen, _photo_surf)
+                    draw_photo(screen, fonts, _photo_surf, _photo_year, _photo_number)
                 else:
                     draw_header(screen, fonts)
                     draw_climate(screen,  fonts, card_rect(0, 0))
@@ -730,9 +801,18 @@ def main():
                     draw_calendar(screen, fonts, card_rect(0, 2))
                     draw_lights(screen,   fonts, card_rect(1, 2))
 
+                if _in_transition and _fade_surf is not None:
+                    elapsed = mono - _fade_start
+                    if elapsed >= FADE_DURATION:
+                        _in_transition = False
+                        _fade_surf = None
+                    else:
+                        _fade_surf.set_alpha(int(255 * (1.0 - elapsed / FADE_DURATION)))
+                        screen.blit(_fade_surf, (0, 0))
+
                 _write_to_fb(screen)
 
-            clock.tick(4)
+            clock.tick(30 if _in_transition else 4)
     finally:
         pygame.quit()
         if _fb_file:
