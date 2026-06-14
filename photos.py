@@ -1,19 +1,15 @@
 """Background photo provider for the dashboard slideshow.
 
-Reads images from a local/network folder (PHOTO_DIR) — populate it however you
-like (a network drive synced from Google Photos / iCloud, a Takeout export, a
-manual copy). Runs on its own thread, mirroring ha_client.HAClient: it
-periodically re-scans the folder and keeps a small cache of decoded,
-panel-sized pygame surfaces in RAM. The main loop pulls a random cached surface
-via next_surface(); if the folder is missing/empty (e.g. an unmounted network
-share) it simply returns None and the dashboard keeps showing.
+Reads images from a local/network folder (PHOTO_DIR). Maintains a shuffled
+deck of all discovered files so every photo is shown before any repeats.
+Pre-decodes one photo at a time on a background thread so next_surface()
+returns immediately without blocking the render loop.
 """
 import logging
 import os
 import random
 import threading
 import time
-from collections import deque
 from datetime import datetime
 
 import pygame
@@ -26,8 +22,7 @@ from config import (
 logger = logging.getLogger(__name__)
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".gif")
-ERROR_BACKOFF = 30         # seconds to wait after a failed tick
-ROTATE_INTERVAL = 30       # seconds between swapping in a fresh photo once full
+ERROR_BACKOFF = 30
 
 
 def _fit(surface: pygame.Surface) -> pygame.Surface:
@@ -58,24 +53,21 @@ def _extract_number(path: str) -> str:
 class PhotoProvider:
     def __init__(self):
         self._files: list[str] = []
-        self._files_scanned = 0.0                      # monotonic of last scan
-        self._cache: deque[tuple[pygame.Surface, str, str]] = deque(maxlen=PHOTO_CACHE_SIZE)
-        self._queue: list[int] = []   # shuffled indices into _cache; refilled when exhausted
+        self._files_scanned = 0.0          # monotonic of last scan
+        self._shuffle: list[str] = []      # remaining paths in current shuffle deck
+        self._ready: tuple | None = None   # pre-decoded (surface, date, number)
         self._lock = threading.Lock()
+        self._want = threading.Event()     # signals background to decode next photo
+        self._want.set()
 
     # -- public API (main thread) ------------------------------------------
     def next_surface(self) -> tuple[pygame.Surface, str, str] | None:
-        """Return the next (surface, date, number) from a shuffle deck; no repeats until all shown."""
+        """Return the pre-decoded (surface, date, number) and trigger the next decode."""
         with self._lock:
-            if not self._cache:
-                return None
-            snapshot = list(self._cache)
-            if len(self._queue) != len(snapshot):
-                # Cache grew or shrank — rebuild deck, keeping remaining unseen indices where valid
-                self._queue = list(range(len(snapshot)))
-                random.shuffle(self._queue)
-            idx = self._queue.pop()
-            return snapshot[idx]
+            result = self._ready
+            self._ready = None
+        self._want.set()
+        return result
 
     # -- background loop ---------------------------------------------------
     def run(self):
@@ -85,23 +77,42 @@ class PhotoProvider:
             except Exception as e:
                 logger.warning(f"photo provider error: {e}; retrying in {ERROR_BACKOFF}s")
                 time.sleep(ERROR_BACKOFF)
-            else:
-                time.sleep(ROTATE_INTERVAL)
 
     def _tick(self):
+        self._want.wait()
+
         now = time.monotonic()
         if not self._files or (now - self._files_scanned) >= PHOTO_RESCAN_MINUTES * 60:
             self._scan()
+
         if not self._files:
+            time.sleep(ERROR_BACKOFF)
             return
-        # Fill the cache fast on startup; afterwards swap in one fresh photo per
-        # tick so the slideshow keeps rotating through the folder over time.
-        with self._lock:
-            have = len(self._cache)
-        maxlen = self._cache.maxlen or 1
-        to_load = (maxlen - have) if have < maxlen else 1
-        for _ in range(to_load):
-            self._load_one()
+
+        self._want.clear()
+
+        # Refill shuffle deck when exhausted — guarantees no repeats within a pass
+        if not self._shuffle:
+            self._shuffle = self._files.copy()
+            random.shuffle(self._shuffle)
+            logger.info(f"photo deck refilled: {len(self._shuffle)} photos")
+
+        # Try a few candidates so one bad file doesn't stall the rotation
+        for _ in range(10):
+            if not self._shuffle:
+                break
+            path = self._shuffle.pop()
+            try:
+                surface = _fit(pygame.image.load(path))
+            except (pygame.error, OSError) as e:
+                logger.warning(f"skipping {path}: {e}")
+                continue
+            with self._lock:
+                self._ready = (surface, _extract_date(path), _extract_number(path))
+            return
+
+        # All candidates failed; signal again so we retry immediately
+        self._want.set()
 
     def _scan(self):
         if not os.path.isdir(PHOTO_DIR):
@@ -113,20 +124,9 @@ class PhotoProvider:
             for name in names:
                 if name.lower().endswith(IMAGE_EXTS):
                     files.append(os.path.join(root, name))
+        random.shuffle(files)
         self._files = files
         self._files_scanned = time.monotonic()
+        # Invalidate the current deck so we pick up any new/removed files
+        self._shuffle = []
         logger.info(f"scanned {len(files)} photos in {PHOTO_DIR}")
-
-    def _load_one(self):
-        # Try a few random files so one unreadable/undecodable image (or a brief
-        # network hiccup) doesn't stall the rotation.
-        for _ in range(5):
-            path = random.choice(self._files)
-            try:
-                surface = _fit(pygame.image.load(path))
-            except (pygame.error, OSError) as e:
-                logger.warning(f"skipping {path}: {e}")
-                continue
-            with self._lock:
-                self._cache.append((surface, _extract_date(path), _extract_number(path)))
-            return
